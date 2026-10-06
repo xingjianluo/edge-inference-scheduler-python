@@ -4,8 +4,10 @@
 1. 候选链 = [请求变体] + 其 fallback_variant_ids 声明的同模型变体，
    顺序即降级顺序；不会尝试链外变体，绝不静默换用。
 2. 对每个候选变体，按 device_id 排序遍历满足硬性约束的设备：
-   先 try_acquire，失败则在 queue_timeout_s 内排队等待，
-   仍失败则记录 RESOURCE_EXHAUSTED 并继续下一个候选。
+   先 try_acquire，失败则进入设备等待队列（容量有限、按优先级准入、
+   可取消），在 queue_timeout_s 内等待；队列已满立即以 QUEUE_FULL
+   拒绝，等待超时记 RESOURCE_EXHAUSTED，两者可区分；被取消则
+   立即以 REQUEST_CANCELLED 终止整个请求，不再尝试其他候选。
 3. 推理失败（算子不支持/超时/设备不可用）时释放资源后按同一顺序
    继续尝试；每次尝试都记录到 decision_log，保证结论可解释。
 4. 所有候选都失败时抛出归一化错误：
@@ -79,7 +81,22 @@ class Scheduler:
 
     # ---- 主入口 ----
 
-    def submit(self, request_id: str, variant_id: str, payload: str) -> InferenceResult:
+    def submit(
+        self,
+        request_id: str,
+        variant_id: str,
+        payload: str,
+        *,
+        priority: int = 0,
+        cancel_event: threading.Event | None = None,
+    ) -> InferenceResult:
+        """提交一个推理请求。
+
+        priority: 等待准入优先级，越大越先拿到资源；同级 FIFO；
+            低优先级有确定等待上界（见 Device 的防饿死规则）。
+        cancel_event: 置位后，仍在排队等待的请求会立即放弃并
+            以 REQUEST_CANCELLED 归一化抛出，不再占用任何资源。
+        """
         variant = self._registry.get(variant_id)
         chain = self._candidate_chain(variant)
         decision = Decision(request_id=request_id)
@@ -106,14 +123,42 @@ class Scheduler:
                 dev_id = device.capability.device_id
                 acquired = device.try_acquire(request_id, candidate.memory_mb)
                 if not acquired:
-                    acquired = device.wait_acquire(
-                        request_id, candidate.memory_mb, self._queue_timeout_s
-                    )
+                    try:
+                        status = device.wait_acquire(
+                            request_id, candidate.memory_mb, self._queue_timeout_s,
+                            priority=priority, cancel_event=cancel_event,
+                        )
+                    except SchedulerError as e:
+                        # 队列已满的背压拒绝：与资源不足区分记录，继续下一候选
+                        if e.code is ErrorCode.QUEUE_FULL:
+                            decision.attempts.append(Attempt(
+                                request_id, candidate.variant_id, dev_id,
+                                ErrorCode.QUEUE_FULL.value, str(e),
+                            ))
+                            last_error = e
+                            continue
+                        raise
+                    if status == "cancelled":
+                        # 等待中被取消：彻底放弃，不再尝试任何候选/设备
+                        decision.attempts.append(Attempt(
+                            request_id, candidate.variant_id, dev_id,
+                            ErrorCode.REQUEST_CANCELLED.value,
+                            "cancelled while waiting in queue",
+                        ))
+                        final = SchedulerError(
+                            ErrorCode.REQUEST_CANCELLED,
+                            f"request {request_id} cancelled while waiting",
+                        )
+                        decision.error_code = final.code.value
+                        with self._log_lock:
+                            self.decision_log.append(decision)
+                        raise final
+                    acquired = status == "acquired"
                 if not acquired:
                     decision.attempts.append(Attempt(
                         request_id, candidate.variant_id, dev_id,
                         ErrorCode.RESOURCE_EXHAUSTED.value,
-                        "no free slot/memory within queue timeout",
+                        "queued but no free slot/memory within queue timeout",
                     ))
                     last_error = SchedulerError(
                         ErrorCode.RESOURCE_EXHAUSTED,
