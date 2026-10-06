@@ -10,7 +10,9 @@ class ErrorCode(enum.Enum):
 
     CAPABILITY_MISSING = "capability_missing"        # 没有任何设备满足硬性能力约束
     VARIANT_INCOMPATIBLE = "variant_incompatible"    # 变体与目标设备硬性约束不匹配
-    RESOURCE_EXHAUSTED = "resource_exhausted"        # 内存/显存不足且队列已满，确定性拒绝
+    RESOURCE_EXHAUSTED = "resource_exhausted"        # 队列有位置但等待超时仍无槽位/内存，确定性拒绝
+    QUEUE_FULL = "queue_full"                        # 等待队列已满，立即拒绝（背压）
+    REQUEST_CANCELLED = "request_cancelled"          # 等待中的请求被取消，不再占用资源也不产出结果
     OPERATOR_UNSUPPORTED = "operator_unsupported"    # 运行时不支持所需算子
     INFERENCE_TIMEOUT = "inference_timeout"          # 单次调用超时
     DEVICE_UNAVAILABLE = "device_unavailable"        # 设备中途不可用

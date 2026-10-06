@@ -4,14 +4,17 @@
 1. 候选链 = [请求变体] + 其 fallback_variant_ids 声明的同模型变体，
    顺序即降级顺序；不会尝试链外变体，绝不静默换用。
 2. 对每个候选变体，按 device_id 排序遍历满足硬性约束的设备：
-   先 try_acquire，失败则在 queue_timeout_s 内排队等待，
-   仍失败则记录 RESOURCE_EXHAUSTED 并继续下一个候选。
-3. 推理失败（算子不支持/超时/设备不可用）时释放资源后按同一顺序
+   先尝试直接占用，资源不足则按队列规则排队（容量背压、优先级、
+   防饿死，见 queueing.py），超时仍失败则记录 RESOURCE_EXHAUSTED
+   并继续下一个候选；队列已满则记录 QUEUE_FULL 并继续下一个候选。
+3. 等待中的请求可通过 cancel() 取消：取消是终态，不再尝试其他
+   候选，直接以 REQUEST_CANCELLED 结束，且不会再占用任何资源。
+4. 推理失败（算子不支持/超时/设备不可用）时释放资源后按同一顺序
    继续尝试；每次尝试都记录到 decision_log，保证结论可解释。
-4. 所有候选都失败时抛出归一化错误：
+5. 所有候选都失败时抛出归一化错误：
    - 没有任何设备满足硬性约束      -> CAPABILITY_MISSING
-   - 全部因资源不足无法调度        -> RESOURCE_EXHAUSTED
-   - 否则                          -> 最后一次运行时错误
+   - 否则                          -> 最后一次失败（RESOURCE_EXHAUSTED /
+                                      QUEUE_FULL / 运行时错误，可区分）
 """
 
 from __future__ import annotations
@@ -77,9 +80,30 @@ class Scheduler:
             chain.append(fb)
         return chain
 
+    # ---- 取消 ----
+
+    def cancel(self, request_id: str) -> bool:
+        """取消一个仍在排队等待的请求。
+
+        返回是否找到等待中的请求。被取消的请求会以 REQUEST_CANCELLED
+        结束，不再占用资源、不再产出结果；已在运行的请求不受影响。
+        """
+        found = False
+        for device in self._devices:
+            if device.cancel_waiter(request_id):
+                found = True
+        return found
+
     # ---- 主入口 ----
 
-    def submit(self, request_id: str, variant_id: str, payload: str) -> InferenceResult:
+    def submit(
+        self,
+        request_id: str,
+        variant_id: str,
+        payload: str,
+        *,
+        priority: int = 0,
+    ) -> InferenceResult:
         variant = self._registry.get(variant_id)
         chain = self._candidate_chain(variant)
         decision = Decision(request_id=request_id)
@@ -104,11 +128,29 @@ class Scheduler:
 
             for device in eligible:
                 dev_id = device.capability.device_id
-                acquired = device.try_acquire(request_id, candidate.memory_mb)
-                if not acquired:
-                    acquired = device.wait_acquire(
-                        request_id, candidate.memory_mb, self._queue_timeout_s
+                try:
+                    acquired = device.acquire(
+                        request_id, candidate.memory_mb,
+                        self._queue_timeout_s, priority=priority,
                     )
+                except SchedulerError as e:
+                    if e.code is ErrorCode.REQUEST_CANCELLED:
+                        # 取消是终态：不再尝试其他候选，直接结束
+                        decision.attempts.append(Attempt(
+                            request_id, candidate.variant_id, dev_id,
+                            e.code.value, str(e),
+                        ))
+                        decision.error_code = e.code.value
+                        with self._log_lock:
+                            self.decision_log.append(decision)
+                        raise
+                    # QUEUE_FULL：背压拒绝，与资源不足区分记录
+                    decision.attempts.append(Attempt(
+                        request_id, candidate.variant_id, dev_id,
+                        e.code.value, str(e),
+                    ))
+                    last_error = e
+                    continue
                 if not acquired:
                     decision.attempts.append(Attempt(
                         request_id, candidate.variant_id, dev_id,
